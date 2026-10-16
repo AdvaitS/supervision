@@ -1,3 +1,4 @@
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -25,10 +26,13 @@ class PolygonZone:
 
     !!! warning
 
-        :class:`~supervision.detection.tools.polygon_zone.PolygonZone` uses the
-        `tracker_id`. Read
+        Entry and exit counts (`in_count`, `out_count` and their per-class
+        variants) use the `tracker_id`. Read
         [here](https://trackers.roboflow.com/latest/) to learn how to plug
-        tracking into your inference pipeline.
+        tracking into your inference pipeline. Without a `tracker_id` they stay
+        at zero, while `current_count` and `current_count_per_class` still work.
+        Detections with a negative `tracker_id`, which trackers report for
+        tracks they have not confirmed yet, never enter or exit.
 
     Attributes:
         polygon: A polygon represented by a numpy array of shape
@@ -46,7 +50,22 @@ class PolygonZone:
             test: it fires only when a listed anchor point lands inside the mask.
             Use mask/IoU-based approaches instead when full-overlap semantics are
             required.
+        minimum_crossing_threshold: Number of consecutive observations a tracked
+            object must spend on the other side of the zone boundary before an
+            entry or exit is counted.
+        max_absent_frames: Number of consecutive frames a tracked object may be
+            missing before its entry/exit state is dropped.
         current_count: The current count of detected objects within the zone
+        current_count_per_class: The current count of detected objects within
+            the zone, keyed by `class_id` (`int` for classified detections,
+            `None` for unclassified ones). Classes with no object in the zone
+            are left out.
+        in_count: The number of tracked objects that have entered the zone.
+        out_count: The number of tracked objects that have exited the zone.
+        in_count_per_class: The number of tracked objects of each class that
+            have entered the zone, keyed by `class_id`.
+        out_count_per_class: The number of tracked objects of each class that
+            have exited the zone, keyed by `class_id`.
         mask: The 2D bool mask for the polygon zone
 
     Example:
@@ -78,6 +97,33 @@ class PolygonZone:
         array([ True])
 
         ```
+
+        Count tracked objects entering and leaving the zone:
+
+        ```pycon
+        >>> import numpy as np
+        >>> import supervision as sv
+        >>> zone = sv.PolygonZone(
+        ...     polygon=np.array([[0, 0], [100, 0], [100, 100], [0, 100]])
+        ... )
+        >>> outside = sv.Detections(
+        ...     xyxy=np.array([[140.0, 40.0, 160.0, 60.0]]),
+        ...     class_id=np.array([2]),
+        ...     tracker_id=np.array([7]),
+        ... )
+        >>> inside = sv.Detections(
+        ...     xyxy=np.array([[40.0, 40.0, 60.0, 60.0]]),
+        ...     class_id=np.array([2]),
+        ...     tracker_id=np.array([7]),
+        ... )
+        >>> for detections in [outside, inside, inside, outside]:
+        ...     _ = zone.trigger(detections)
+        >>> zone.in_count, zone.out_count
+        (1, 1)
+        >>> zone.in_count_per_class
+        {2: 1}
+
+        ```
     """
 
     def __init__(
@@ -85,6 +131,8 @@ class PolygonZone:
         polygon: npt.NDArray[np.int64],
         triggering_anchors: Iterable[Position] = (Position.BOTTOM_CENTER,),
         require_all_anchors: bool = True,
+        minimum_crossing_threshold: int = 1,
+        max_absent_frames: int = 30,
     ) -> None:
         """Build a zone from a polygon.
 
@@ -95,11 +143,27 @@ class PolygonZone:
                 decide whether it falls inside the zone.
             require_all_anchors: Whether every triggering anchor must be inside
                 for the detection to count, rather than any one of them.
+            minimum_crossing_threshold: A tracked object must be seen on the
+                other side of the zone boundary for this many consecutive
+                observations before its entry or exit is counted. Frames in
+                which the object is missing are skipped: they neither extend
+                nor reset the run. Raise it to ignore anchors that flicker
+                across the boundary. The first side an object is seen on is
+                taken as its starting side with no count, so an object that
+                first appears inside the zone has not entered it.
+            max_absent_frames: The entry/exit state of a tracked object is kept
+                while it is missing for up to this many consecutive frames, so
+                a short occlusion does not reset it, and dropped after that to
+                bound memory on long streams. Match it to the tracker's
+                lost-track buffer. An object that is dropped while inside the
+                zone, for example because it left the frame through the zone,
+                is not counted as exiting.
 
         Raises:
             ValueError: If `polygon` is not of shape `(N, 2)`, has fewer than
-                `MIN_POLYGON_POINT_COUNT` vertices, or `triggering_anchors` is
-                empty.
+                `MIN_POLYGON_POINT_COUNT` vertices, `triggering_anchors` is
+                empty, or `minimum_crossing_threshold` or `max_absent_frames`
+                is less than 1.
         """
         polygon = np.asarray(polygon)
         if polygon.ndim != 2 or polygon.shape[-1] != 2:
@@ -120,13 +184,88 @@ class PolygonZone:
         if not self.triggering_anchors:
             raise ValueError("Triggering anchors cannot be empty.")
         self.require_all_anchors = require_all_anchors
+        if minimum_crossing_threshold < 1:
+            raise ValueError(
+                "minimum_crossing_threshold must be at least 1; "
+                f"got {minimum_crossing_threshold}."
+            )
+        if max_absent_frames < 1:
+            raise ValueError(
+                f"max_absent_frames must be at least 1; got {max_absent_frames}."
+            )
+        self.minimum_crossing_threshold = minimum_crossing_threshold
+        self.max_absent_frames = max_absent_frames
 
         self.current_count = 0
+        self._current_count_per_class: Counter[int | None] = Counter()
+        self._in_count_per_class: Counter[int | None] = Counter()
+        self._out_count_per_class: Counter[int | None] = Counter()
+        # Side of the boundary (True = inside) each tracker was last confirmed on.
+        # Entries and exits are counted against it, never against the raw previous
+        # frame, so a sub-threshold flicker cannot become the reference side.
+        self._confirmed_inside: dict[int, bool] = {}
+        # Consecutive observations a tracker has spent away from its confirmed side.
+        self._observations_away: dict[int, int] = {}
+        self._frames_absent: dict[int, int] = {}
 
         x_max, y_max = np.max(polygon, axis=0)
         self.mask = polygon_to_mask(
             polygon=polygon, resolution_wh=(x_max + 2, y_max + 2)
         )
+
+    @property
+    def current_count_per_class(self) -> dict[int | None, int]:
+        """Objects inside the zone on the last frame, keyed by `class_id`."""
+        return dict(self._current_count_per_class)
+
+    @property
+    def in_count(self) -> int:
+        """Tracked objects that have entered the zone since creation or reset."""
+        return sum(self._in_count_per_class.values())
+
+    @property
+    def out_count(self) -> int:
+        """Tracked objects that have exited the zone since creation or reset."""
+        return sum(self._out_count_per_class.values())
+
+    @property
+    def in_count_per_class(self) -> dict[int | None, int]:
+        """Tracked objects that have entered the zone, keyed by `class_id`."""
+        return dict(self._in_count_per_class)
+
+    @property
+    def out_count_per_class(self) -> dict[int | None, int]:
+        """Tracked objects that have exited the zone, keyed by `class_id`."""
+        return dict(self._out_count_per_class)
+
+    def reset(self) -> None:
+        """Clear all counts and per-track state so the zone can be reused across
+        independent streams. The polygon and configuration are preserved.
+
+        Example:
+            ```pycon
+            >>> import numpy as np
+            >>> import supervision as sv
+            >>> zone = sv.PolygonZone(
+            ...     polygon=np.array([[0, 0], [100, 0], [100, 100], [0, 100]])
+            ... )
+            >>> detections = sv.Detections(xyxy=np.array([[40.0, 40.0, 60.0, 60.0]]))
+            >>> _ = zone.trigger(detections)
+            >>> zone.current_count
+            1
+            >>> zone.reset()
+            >>> zone.current_count, zone.in_count, zone.current_count_per_class
+            (0, 0, {})
+
+            ```
+        """
+        self.current_count = 0
+        self._current_count_per_class.clear()
+        self._in_count_per_class.clear()
+        self._out_count_per_class.clear()
+        self._confirmed_inside.clear()
+        self._observations_away.clear()
+        self._frames_absent.clear()
 
     def trigger(
         self,
@@ -172,9 +311,18 @@ class PolygonZone:
             ```
         """
         if len(detections) == 0:
-            self.current_count = 0
-            return cast(npt.NDArray[np.bool_], np.array([], dtype=bool))
+            is_in_zone = np.array([], dtype=bool)
+        else:
+            is_in_zone = self._is_in_zone(detections, coord_transform)
+        self._update_counts(detections, is_in_zone)
+        return cast(npt.NDArray[np.bool_], is_in_zone)
 
+    def _is_in_zone(
+        self,
+        detections: Detections,
+        coord_transform: CoordinatesTransformation | None,
+    ) -> npt.NDArray[np.bool_]:
+        """Test each detection's triggering anchors against the zone mask."""
         anchor_coordinates = np.array(
             [
                 detections.get_anchors_coordinates(anchors)
@@ -209,8 +357,74 @@ class PolygonZone:
         anchor_hits = in_bounds & self.mask[y_safe, x_safe]
         reduce = np.all if self.require_all_anchors else np.any
         is_in_zone = reduce(anchor_hits, axis=0)
-        self.current_count = int(np.sum(is_in_zone))
         return cast(npt.NDArray[np.bool_], is_in_zone.astype(bool))
+
+    def _update_counts(
+        self, detections: Detections, is_in_zone: npt.NDArray[np.bool_]
+    ) -> None:
+        """Refresh this frame's occupancy counts and advance each track's entry/exit
+        state, counting confirmed boundary crossings."""
+        self.current_count = int(np.sum(is_in_zone))
+        self._current_count_per_class.clear()
+        if detections.class_id is None:
+            if self.current_count:
+                self._current_count_per_class[None] = self.current_count
+        else:
+            class_ids, counts = np.unique(
+                detections.class_id[is_in_zone], return_counts=True
+            )
+            self._current_count_per_class.update(
+                {int(c): int(n) for c, n in zip(class_ids, counts)}
+            )
+
+        if detections.tracker_id is None:
+            self._age_absent_tracks(present=set())
+            return
+
+        # Trackers report a negative id for tracks they have not confirmed yet, and
+        # several distinct objects can share it, so such detections get no state.
+        confirmed = np.flatnonzero(detections.tracker_id >= 0)
+        self._age_absent_tracks(
+            present={int(detections.tracker_id[i]) for i in confirmed}
+        )
+        for i in confirmed:
+            key = int(detections.tracker_id[i])
+            inside = bool(is_in_zone[i])
+            # The first observed side seeds the reference; nothing was crossed yet.
+            confirmed_inside = self._confirmed_inside.setdefault(key, inside)
+            if inside == confirmed_inside:
+                self._observations_away.pop(key, None)
+                continue
+
+            observations_away = self._observations_away.get(key, 0) + 1
+            if observations_away < self.minimum_crossing_threshold:
+                self._observations_away[key] = observations_away
+                continue
+
+            self._observations_away.pop(key, None)
+            self._confirmed_inside[key] = inside
+            class_id = (
+                None if detections.class_id is None else int(detections.class_id[i])
+            )
+            if inside:
+                self._in_count_per_class[class_id] += 1
+            else:
+                self._out_count_per_class[class_id] += 1
+
+    def _age_absent_tracks(self, present: set[int]) -> None:
+        """Advance the absence counter of every known track missing from this frame,
+        dropping the state of tracks absent beyond `max_absent_frames`."""
+        for key in list(self._confirmed_inside):
+            if key in present:
+                self._frames_absent.pop(key, None)
+                continue
+            frames_absent = self._frames_absent.get(key, 0) + 1
+            if frames_absent > self.max_absent_frames:
+                del self._confirmed_inside[key]
+                self._observations_away.pop(key, None)
+                self._frames_absent.pop(key, None)
+            else:
+                self._frames_absent[key] = frames_absent
 
 
 class PolygonZoneAnnotator:

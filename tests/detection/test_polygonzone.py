@@ -93,6 +93,26 @@ class TestPolygonZoneInit:
         with pytest.raises(ValueError, match=r"shape \(N, 2\)"):
             sv.PolygonZone(np.array([0, 0, 40, 0, 40, 40]))
 
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            pytest.param(
+                {"minimum_crossing_threshold": 0},
+                "minimum_crossing_threshold",
+                id="zero-crossing-threshold",
+            ),
+            pytest.param(
+                {"max_absent_frames": 0}, "max_absent_frames", id="zero-absent-frames"
+            ),
+        ],
+    )
+    def test_non_positive_tracking_parameter_raises(
+        self, kwargs: dict[str, int], match: str
+    ) -> None:
+        """Debounce and absence windows must allow at least one frame."""
+        with pytest.raises(ValueError, match=match):
+            sv.PolygonZone(POLYGON, **kwargs)
+
 
 class TestPolygonZoneTrigger:
     @pytest.mark.parametrize(
@@ -432,3 +452,179 @@ class TestPolygonZoneTriggerWithCoordTransform:
 
         with pytest.raises(ValueError, match="coord_transform must return"):
             zone.trigger(DETECTIONS, coord_transform=_WrongShapeTransform())
+
+
+INSIDE_BOX = [140.0, 140.0, 160.0, 160.0]
+OUTSIDE_BOX = [10.0, 10.0, 30.0, 30.0]
+
+
+def _tracked_frame(
+    positions: list[str], class_ids: list[int] | None = None
+) -> sv.Detections:
+    """Build one frame where object `i` has tracker id `i` at an 'in'/'out' box."""
+    if not positions:
+        return sv.Detections.empty()
+    boxes = [INSIDE_BOX if position == "in" else OUTSIDE_BOX for position in positions]
+    return _create_detections(
+        xyxy=boxes,
+        class_id=class_ids,
+        tracker_id=list(range(len(positions))),
+    )
+
+
+class TestPolygonZoneCurrentCountPerClass:
+    @pytest.mark.parametrize(
+        ("positions", "class_ids", "expected"),
+        [
+            pytest.param(
+                ["in", "in", "in", "out"], [0, 1, 1, 0], {0: 1, 1: 2}, id="mixed"
+            ),
+            pytest.param(["in", "out"], [0, 3], {0: 1}, id="omits-absent-class"),
+            pytest.param(["in", "in"], None, {None: 2}, id="unclassified"),
+            pytest.param(["out"], None, {}, id="unclassified-none-inside"),
+            pytest.param([], None, {}, id="empty-frame"),
+        ],
+    )
+    def test_counts_objects_inside_by_class(
+        self,
+        positions: list[str],
+        class_ids: list[int] | None,
+        expected: dict[int | None, int],
+    ) -> None:
+        """Only detections inside the zone are counted, grouped by class id."""
+        zone = sv.PolygonZone(POLYGON)
+
+        zone.trigger(_tracked_frame(positions, class_ids))
+
+        assert zone.current_count_per_class == expected
+
+    def test_reflects_only_latest_frame(self) -> None:
+        """Per-class occupancy is replaced, not accumulated, on each frame."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["in", "in"], [0, 1]))
+
+        zone.trigger(_tracked_frame(["in"], [1]))
+
+        assert zone.current_count_per_class == {1: 1}
+
+
+class TestPolygonZoneEntryExit:
+    @pytest.mark.parametrize(
+        ("sequence", "zone_kwargs", "expected_in_out"),
+        [
+            pytest.param(["out", "in"], {}, (1, 0), id="enters"),
+            pytest.param(["out", "in", "out"], {}, (1, 1), id="enters-and-exits"),
+            pytest.param(["in", "out"], {}, (0, 1), id="first-seen-inside"),
+            pytest.param(["in", "in"], {}, (0, 0), id="stays-inside"),
+            pytest.param(
+                ["out", "in", "out", "in"], {}, (2, 1), id="re-enters-after-exit"
+            ),
+            pytest.param(
+                ["out", "in", "out"],
+                {"minimum_crossing_threshold": 2},
+                (0, 0),
+                id="flicker-below-threshold",
+            ),
+            pytest.param(
+                ["out", "in", "in"],
+                {"minimum_crossing_threshold": 2},
+                (1, 0),
+                id="sustained-entry-at-threshold",
+            ),
+            pytest.param(
+                ["out", "in", None, "in"],
+                {"minimum_crossing_threshold": 2},
+                (1, 0),
+                id="missing-frame-does-not-reset-run",
+            ),
+            pytest.param(
+                ["out", None, None, "in"],
+                {"max_absent_frames": 2},
+                (1, 0),
+                id="state-kept-through-short-absence",
+            ),
+            pytest.param(
+                ["out", None, None, "in"],
+                {"max_absent_frames": 1},
+                (0, 0),
+                id="state-dropped-after-long-absence",
+            ),
+        ],
+    )
+    def test_counts_confirmed_boundary_crossings(
+        self,
+        sequence: list[str | None],
+        zone_kwargs: dict[str, int],
+        expected_in_out: tuple[int, int],
+    ) -> None:
+        """A tracked object's entries and exits follow its confirmed side changes."""
+        zone = sv.PolygonZone(POLYGON, **zone_kwargs)
+
+        for position in sequence:
+            zone.trigger(_tracked_frame([] if position is None else [position], [0]))
+
+        assert (zone.in_count, zone.out_count) == expected_in_out
+
+    def test_counts_entries_and_exits_per_class(self) -> None:
+        """Each crossing is attributed to the class of the crossing detection."""
+        zone = sv.PolygonZone(POLYGON)
+        frames = [
+            _tracked_frame(["out", "out", "out"], [0, 1, 1]),
+            _tracked_frame(["in", "in", "in"], [0, 1, 1]),
+            _tracked_frame(["in", "out", "in"], [0, 1, 1]),
+        ]
+
+        for frame in frames:
+            zone.trigger(frame)
+
+        assert zone.in_count_per_class == {0: 1, 1: 2}
+        assert zone.out_count_per_class == {1: 1}
+
+    def test_unclassified_crossings_are_keyed_by_none(self) -> None:
+        """Detections without class ids are counted under the `None` key."""
+        zone = sv.PolygonZone(POLYGON)
+
+        for position in ["out", "in"]:
+            zone.trigger(_tracked_frame([position]))
+
+        assert zone.in_count_per_class == {None: 1}
+
+    def test_unconfirmed_tracker_ids_are_ignored(self) -> None:
+        """Negative tracker ids are shared by unconfirmed tracks and never count."""
+        zone = sv.PolygonZone(POLYGON)
+        frames = [
+            _create_detections(xyxy=[OUTSIDE_BOX], class_id=[0], tracker_id=[-1]),
+            _create_detections(xyxy=[INSIDE_BOX], class_id=[0], tracker_id=[-1]),
+        ]
+
+        for frame in frames:
+            zone.trigger(frame)
+
+        assert (zone.in_count, zone.out_count) == (0, 0)
+
+    def test_untracked_detections_only_update_occupancy(self) -> None:
+        """Without tracker ids, occupancy is counted but no entry is recorded."""
+        zone = sv.PolygonZone(POLYGON)
+        frames = [
+            _create_detections(xyxy=[OUTSIDE_BOX], class_id=[0]),
+            _create_detections(xyxy=[INSIDE_BOX], class_id=[0]),
+        ]
+
+        for frame in frames:
+            zone.trigger(frame)
+
+        assert (zone.current_count, zone.in_count) == (1, 0)
+
+
+class TestPolygonZoneReset:
+    def test_clears_counts_and_track_state(self) -> None:
+        """After reset, a track already inside is re-seeded rather than counted."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["out"], [0]))
+        zone.trigger(_tracked_frame(["in"], [0]))
+
+        zone.reset()
+        zone.trigger(_tracked_frame(["out"], [0]))
+
+        assert (zone.in_count, zone.out_count, zone.current_count) == (0, 0, 0)
+        assert zone.in_count_per_class == {}
