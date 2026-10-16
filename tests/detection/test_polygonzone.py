@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import supervision as sv
+from supervision.config import ORIENTED_BOX_COORDINATES
 from tests.helpers import (
     _ConstantTransform,
     _create_detections,
@@ -628,3 +629,129 @@ class TestPolygonZoneReset:
 
         assert (zone.in_count, zone.out_count, zone.current_count) == (0, 0, 0)
         assert zone.in_count_per_class == {}
+
+
+ZONE_PIXELS = 101 * 101
+LEFT_HALF_PIXELS = 51 * 101
+
+
+def _left_half_mask(image_wh: tuple[int, int] = (250, 250)) -> np.ndarray:
+    """Return one `(1, H, W)` mask covering zone columns 100-150 on every zone row."""
+    width, height = image_wh
+    mask = np.zeros((1, height, width), dtype=bool)
+    mask[0, 100:201, 100:151] = True
+    return mask
+
+
+class TestPolygonZoneOccupancy:
+    @pytest.mark.parametrize(
+        ("xyxy", "expected_pixels"),
+        [
+            pytest.param([[100, 100, 200, 200]], ZONE_PIXELS, id="zone-box"),
+            pytest.param([[100, 100, 150, 200]], LEFT_HALF_PIXELS, id="left-half"),
+            pytest.param(
+                [[100, 100, 150, 200], [125, 100, 175, 200]],
+                76 * 101,
+                id="overlap-counted-once",
+            ),
+            pytest.param(
+                [[100, 100, 150, 200], [100, 100, 150, 200]],
+                LEFT_HALF_PIXELS,
+                id="duplicate-boxes",
+            ),
+            pytest.param([[-50, -50, 150, 150]], 51 * 51, id="partly-outside"),
+            pytest.param([[0, 0, 50, 50]], 0, id="outside"),
+            pytest.param([[150, 200, 100, 100]], LEFT_HALF_PIXELS, id="reversed"),
+            pytest.param(
+                [[100.9, 100, 150.9, 200]], LEFT_HALF_PIXELS, id="fractional-edges"
+            ),
+        ],
+    )
+    def test_box_coverage(self, xyxy: list[list[float]], expected_pixels: int) -> None:
+        """Covered zone pixels are the union of the boxes, edges inclusive."""
+        zone = sv.PolygonZone(POLYGON)
+        detections = sv.Detections(xyxy=np.array(xyxy, dtype=np.float64))
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(expected_pixels / ZONE_PIXELS)
+
+    def test_empty_detections_are_zero(self) -> None:
+        """No detections cover nothing."""
+        zone = sv.PolygonZone(POLYGON)
+
+        occupancy = zone.occupancy(sv.Detections.empty())
+
+        assert occupancy == 0.0
+
+    def test_mask_takes_precedence_over_box(self) -> None:
+        """A mask narrower than its box is measured by its own pixels."""
+        zone = sv.PolygonZone(POLYGON)
+        detections = sv.Detections(
+            xyxy=np.array([[100.0, 100.0, 200.0, 200.0]]), mask=_left_half_mask()
+        )
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(LEFT_HALF_PIXELS / ZONE_PIXELS)
+
+    def test_compact_mask_matches_dense_mask(self) -> None:
+        """Compact and dense masks of the same objects give the same occupancy."""
+        zone = sv.PolygonZone(POLYGON)
+        masks = np.concatenate([_left_half_mask(), np.zeros((1, 250, 250), bool)])
+        masks[1, 150:181, 140:191] = True
+        xyxy = sv.mask_to_xyxy(masks).astype(np.float32)
+        compact = sv.CompactMask.from_dense(masks, xyxy, image_shape=(250, 250))
+        dense_detections = sv.Detections(xyxy=xyxy, mask=masks)
+        compact_detections = sv.Detections(xyxy=xyxy, mask=compact)
+
+        occupancy = zone.occupancy(compact_detections)
+
+        assert occupancy == pytest.approx(zone.occupancy(dense_detections))
+
+    def test_mask_image_smaller_than_zone(self) -> None:
+        """Zone pixels beyond the mask's image are counted as uncovered."""
+        zone = sv.PolygonZone(POLYGON)
+        detections = sv.Detections(
+            xyxy=np.array([[0.0, 0.0, 149.0, 149.0]]),
+            mask=np.ones((1, 150, 150), dtype=bool),
+        )
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(50 * 50 / ZONE_PIXELS)
+
+    def test_oriented_boxes_take_precedence_over_box(self) -> None:
+        """Oriented-box corners, not their axis-aligned envelope, are measured."""
+        zone = sv.PolygonZone(POLYGON)
+        detections = sv.Detections(
+            xyxy=np.array([[100.0, 100.0, 200.0, 200.0]]),
+            data={
+                ORIENTED_BOX_COORDINATES: np.array(
+                    [[[100, 100], [150, 100], [150, 200], [100, 200]]], dtype=float
+                )
+            },
+        )
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(LEFT_HALF_PIXELS / ZONE_PIXELS)
+
+    def test_overlapping_oriented_boxes_are_counted_once(self) -> None:
+        """The overlap of two oriented boxes stays covered instead of cancelling."""
+        zone = sv.PolygonZone(POLYGON)
+        corners = np.array(
+            [
+                [[100, 100], [150, 100], [150, 200], [100, 200]],
+                [[125, 100], [175, 100], [175, 200], [125, 200]],
+            ],
+            dtype=float,
+        )
+        detections = sv.Detections(
+            xyxy=np.array([[100.0, 100.0, 150.0, 200.0], [125.0, 100.0, 175.0, 200.0]]),
+            data={ORIENTED_BOX_COORDINATES: corners},
+        )
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(76 * 101 / ZONE_PIXELS)

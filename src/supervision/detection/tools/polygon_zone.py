@@ -7,6 +7,8 @@ import numpy.typing as npt
 
 from supervision import Detections
 from supervision import _cv2 as cv2
+from supervision.config import ORIENTED_BOX_COORDINATES
+from supervision.detection.compact_mask import CompactMask, _compact_mask_union
 from supervision.detection.utils.converters import (
     MIN_POLYGON_POINT_COUNT,
     polygon_to_mask,
@@ -267,6 +269,54 @@ class PolygonZone:
         self._observations_away.clear()
         self._frames_absent.clear()
 
+    def occupancy(self, detections: Detections) -> float:
+        """Measure the fraction of the zone covered by the detections.
+
+        Unlike :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.trigger`,
+        which tests anchor points, this compares the detections' full geometry
+        with the zone's pixels. It uses the richest geometry present: masks if
+        set, otherwise oriented boxes stored in `data` under
+        `ORIENTED_BOX_COORDINATES`, otherwise the `xyxy` boxes. Overlapping
+        detections are counted once, and pixels on a box or polygon edge count
+        as covered, matching the zone mask. Every
+        detection passed in is measured, so filter first to measure a subset,
+        for example one class. Detections are measured in the zone's own frame
+        coordinates; no `coord_transform` is applied. Calling it does not
+        change the zone's counts.
+
+        Args:
+            detections: The detections whose geometry covers the zone.
+
+        Returns:
+            Covered zone pixels divided by all zone pixels, from `0.0` (empty)
+            to `1.0` (fully covered).
+
+        Example:
+            ```pycon
+            >>> import numpy as np
+            >>> import supervision as sv
+            >>> zone = sv.PolygonZone(
+            ...     polygon=np.array([[0, 0], [99, 0], [99, 99], [0, 99]])
+            ... )
+            >>> detections = sv.Detections(
+            ...     xyxy=np.array([[0.0, 0.0, 49.0, 99.0], [25.0, 0.0, 74.0, 99.0]]),
+            ...     class_id=np.array([0, 1]),
+            ... )
+            >>> zone.occupancy(detections)
+            0.75
+            >>> zone.occupancy(detections[detections.class_id == 0])
+            0.5
+
+            ```
+        """
+        x0, y0 = (int(value) for value in np.maximum(self.polygon.min(axis=0), 0))
+        zone = self.mask[y0:, x0:].astype(bool)
+        zone_pixels = np.count_nonzero(zone)
+        if zone_pixels == 0 or len(detections) == 0:
+            return 0.0
+        covered = _rasterize_detections(detections, origin=(x0, y0), shape=zone.shape)
+        return float(np.count_nonzero(covered & zone) / zone_pixels)
+
     def trigger(
         self,
         detections: Detections,
@@ -425,6 +475,108 @@ class PolygonZone:
                 self._frames_absent.pop(key, None)
             else:
                 self._frames_absent[key] = frames_absent
+
+
+def _rasterize_detections(
+    detections: Detections, origin: tuple[int, int], shape: tuple[int, int]
+) -> npt.NDArray[np.bool_]:
+    """Rasterize the union of the detections' richest geometry into a window of `shape`
+    whose top-left pixel is at absolute `origin`."""
+    if detections.mask is not None:
+        return _rasterize_masks(detections.mask, origin, shape)
+    if ORIENTED_BOX_COORDINATES in detections.data:
+        polygons = np.asarray(detections.data[ORIENTED_BOX_COORDINATES])
+        return _rasterize_polygons(polygons, origin, shape)
+    return _rasterize_boxes(detections.xyxy, origin, shape)
+
+
+def _or_into_window(
+    window: npt.NDArray[np.bool_],
+    origin: tuple[int, int],
+    region: npt.NDArray[np.bool_],
+    region_origin: tuple[int, int],
+) -> None:
+    """OR a boolean `region` placed at absolute `region_origin` into `window`, whose
+    top-left pixel is at absolute `origin`, ignoring parts outside it."""
+    x0, y0 = origin
+    region_x, region_y = region_origin
+    left, top = max(region_x, x0), max(region_y, y0)
+    right = min(region_x + region.shape[1], x0 + window.shape[1])
+    bottom = min(region_y + region.shape[0], y0 + window.shape[0])
+    if right <= left or bottom <= top:
+        return
+    window[top - y0 : bottom - y0, left - x0 : right - x0] |= region[
+        top - region_y : bottom - region_y, left - region_x : right - region_x
+    ]
+
+
+def _rasterize_masks(
+    masks: npt.NDArray[np.bool_] | CompactMask,
+    origin: tuple[int, int],
+    shape: tuple[int, int],
+) -> npt.NDArray[np.bool_]:
+    """Union instance masks inside the window without materializing a full `(N, H, W)`
+    stack for compact masks."""
+    x0, y0 = origin
+    height, width = shape
+    window = np.zeros(shape, dtype=bool)
+    if isinstance(masks, CompactMask):
+        union = _compact_mask_union([masks])
+        union_x, union_y = (int(value) for value in union.offsets[0])
+        _or_into_window(window, origin, union.crop(0), (union_x, union_y))
+    else:
+        region = np.any(masks[:, y0 : y0 + height, x0 : x0 + width], axis=0)
+        _or_into_window(window, origin, region, origin)
+    return window
+
+
+def _rasterize_polygons(
+    polygons: npt.NDArray[np.number],
+    origin: tuple[int, int],
+    shape: tuple[int, int],
+) -> npt.NDArray[np.bool_]:
+    """Union filled polygons of shape `(N, K, 2)` inside the window."""
+    canvas = np.zeros(shape, dtype=np.uint8)
+    # Truncate absolute vertices first, as polygon_to_mask does, so the window
+    # holds exactly the pixels a full-frame mask would; the clip only keeps
+    # far-off vertices inside the int32 range fillPoly accepts.
+    vertices = np.clip(polygons, -(2**30), 2**30).astype(np.int32)
+    shifted = vertices - np.array(origin, dtype=np.int32)
+    # One call per polygon: a single fillPoly over several polygons uses the
+    # even-odd rule and would clear the pixels where two detections overlap.
+    for polygon in shifted:
+        cv2.fillPoly(canvas, [polygon], color=(1,))
+    return canvas.astype(bool)
+
+
+def _rasterize_boxes(
+    xyxy: npt.NDArray[np.number],
+    origin: tuple[int, int],
+    shape: tuple[int, int],
+) -> npt.NDArray[np.bool_]:
+    """Union axis-aligned boxes inside the window, edges inclusive, with a 2-D
+    difference array so the cost does not grow with the box count."""
+    height, width = shape
+    offset = np.array(origin)
+    size = np.array([width, height])
+    corners = np.asarray(xyxy, dtype=np.float64).reshape(-1, 2, 2)
+    # Clipping to one pixel beyond the window before truncating keeps every
+    # in-window coordinate exact and avoids integer overflow for far-off boxes.
+    corners = np.clip(corners, offset - 1, offset + size)
+    corners = np.trunc(corners).astype(np.int64) - offset
+    top_left = corners.min(axis=1)
+    bottom_right = corners.max(axis=1)
+    visible = np.all(bottom_right >= 0, axis=1) & np.all(top_left < size, axis=1)
+    top_left = np.maximum(top_left[visible], 0)
+    bottom_right = np.minimum(bottom_right[visible], size - 1) + 1
+
+    edges = np.zeros((height + 1, width + 1), dtype=np.int32)
+    np.add.at(edges, (top_left[:, 1], top_left[:, 0]), 1)
+    np.add.at(edges, (top_left[:, 1], bottom_right[:, 0]), -1)
+    np.add.at(edges, (bottom_right[:, 1], top_left[:, 0]), -1)
+    np.add.at(edges, (bottom_right[:, 1], bottom_right[:, 0]), 1)
+    coverage = edges.cumsum(axis=0).cumsum(axis=1)
+    return coverage[:height, :width] > 0
 
 
 class PolygonZoneAnnotator:
