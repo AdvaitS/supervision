@@ -755,3 +755,143 @@ class TestPolygonZoneOccupancy:
         occupancy = zone.occupancy(detections)
 
         assert occupancy == pytest.approx(76 * 101 / ZONE_PIXELS)
+
+
+def _run_sequence(zone: sv.PolygonZone, sequence: list[str | None]) -> None:
+    """Trigger `zone` once per entry: 'in'/'out' for tracker 0, `None` for absent."""
+    for position in sequence:
+        zone.trigger(_tracked_frame([] if position is None else [position], [0]))
+
+
+class TestPolygonZoneTimeInZone:
+    @pytest.mark.parametrize(
+        ("sequence", "zone_kwargs", "expected"),
+        [
+            pytest.param(["out", "in", "in", "in"], {}, 2.0, id="since-entry"),
+            pytest.param(["in", "in"], {}, 1.0, id="first-seen-inside"),
+            pytest.param(["out", "in", "out"], {}, np.nan, id="after-exit"),
+            pytest.param(
+                ["out", "in", "out", "in", "in"], {}, 1.0, id="re-entry-restarts"
+            ),
+            pytest.param(["out"], {}, np.nan, id="never-inside"),
+            pytest.param(
+                ["out", "in", "in"],
+                {"minimum_crossing_threshold": 2},
+                1.0,
+                id="entry-dated-to-run-start",
+            ),
+            pytest.param(
+                ["in", "out", "in"],
+                {"minimum_crossing_threshold": 2},
+                2.0,
+                id="flicker-keeps-stay",
+            ),
+            pytest.param(
+                ["out", "in", None, "in"], {}, 2.0, id="short-absence-keeps-stay"
+            ),
+            pytest.param(
+                ["in", None, None, "in"],
+                {"max_absent_frames": 1},
+                0.0,
+                id="long-absence-restarts",
+            ),
+        ],
+    )
+    def test_counts_frames_of_current_stay(
+        self,
+        sequence: list[str | None],
+        zone_kwargs: dict[str, int],
+        expected: float,
+    ) -> None:
+        """Without timestamps, dwell is the frames since the current stay began."""
+        zone = sv.PolygonZone(POLYGON, **zone_kwargs)
+        _run_sequence(zone, sequence)
+
+        dwell = zone.time_in_zone(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(dwell, [expected])
+
+    def test_uses_given_timestamps(self) -> None:
+        """Explicit timestamps set the unit, such as seconds."""
+        zone = sv.PolygonZone(POLYGON)
+        for position, timestamp in [("out", 10.0), ("in", 10.5), ("in", 12.0)]:
+            zone.trigger(_tracked_frame([position], [0]), timestamp=timestamp)
+
+        dwell = zone.time_in_zone(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(dwell, [1.5])
+
+    def test_aligns_with_the_detections_passed(self) -> None:
+        """Each object gets its own dwell, in the order of the detections given."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["in", "out"], [0, 0]))
+        zone.trigger(_tracked_frame(["in", "in"], [0, 0]))
+        detections = _create_detections(
+            xyxy=[INSIDE_BOX, INSIDE_BOX, INSIDE_BOX], tracker_id=[1, 0, 9]
+        )
+
+        dwell = zone.time_in_zone(detections)
+
+        np.testing.assert_array_equal(dwell, [0.0, 1.0, np.nan])
+
+    @pytest.mark.parametrize(
+        "detections",
+        [
+            pytest.param(
+                _create_detections(xyxy=[INSIDE_BOX], tracker_id=[-1]),
+                id="unconfirmed-tracker",
+            ),
+            pytest.param(_create_detections(xyxy=[INSIDE_BOX]), id="untracked"),
+        ],
+    )
+    def test_is_nan_without_a_confirmed_tracker_id(
+        self, detections: sv.Detections
+    ) -> None:
+        """Objects the zone cannot follow have no dwell."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(detections)
+
+        dwell = zone.time_in_zone(detections)
+
+        np.testing.assert_array_equal(dwell, [np.nan])
+
+    def test_is_nan_before_any_trigger(self) -> None:
+        """A zone that has seen no frames reports no dwell."""
+        zone = sv.PolygonZone(POLYGON)
+
+        dwell = zone.time_in_zone(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(dwell, [np.nan])
+
+    @pytest.mark.parametrize(
+        ("timestamps", "match"),
+        [
+            pytest.param([5.0, 4.0], "must not decrease", id="decreasing"),
+            pytest.param([5.0, None], "must not decrease", id="mixed-with-frames"),
+            pytest.param([np.nan], "must be finite", id="nan"),
+            pytest.param([np.inf], "must be finite", id="inf"),
+        ],
+    )
+    def test_rejects_invalid_timestamps(
+        self, timestamps: list[float | None], match: str
+    ) -> None:
+        """A timestamp must be finite and never earlier than the previous one."""
+        zone = sv.PolygonZone(POLYGON)
+        *earlier, last = timestamps
+        for timestamp in earlier:
+            zone.trigger(_tracked_frame(["in"], [0]), timestamp=timestamp)
+
+        with pytest.raises(ValueError, match=match):
+            zone.trigger(_tracked_frame(["in"], [0]), timestamp=last)
+
+    def test_reset_restarts_the_clock(self) -> None:
+        """After reset, frame counting and stays start over."""
+        zone = sv.PolygonZone(POLYGON)
+        _run_sequence(zone, ["in", "in", "in"])
+
+        zone.reset()
+        zone.trigger(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(
+            zone.time_in_zone(_tracked_frame(["in"], [0])), [0.0]
+        )
