@@ -473,6 +473,12 @@ def _tracked_frame(
     )
 
 
+def _run_sequence(zone: sv.PolygonZone, sequence: list[str | None]) -> None:
+    """Trigger `zone` once per entry: 'in'/'out' for tracker 0, `None` for absent."""
+    for position in sequence:
+        zone.trigger(_tracked_frame([] if position is None else [position], [0]))
+
+
 class TestPolygonZoneCurrentCountPerClass:
     @pytest.mark.parametrize(
         ("positions", "class_ids", "expected"),
@@ -550,6 +556,24 @@ class TestPolygonZoneEntryExit:
                 (0, 0),
                 id="state-dropped-after-long-absence",
             ),
+            pytest.param(
+                ["in", "out", "in"],
+                {"minimum_crossing_threshold": 2},
+                (0, 0),
+                id="exit-flicker-below-threshold",
+            ),
+            pytest.param(
+                ["in", "out", "out"],
+                {"minimum_crossing_threshold": 2},
+                (0, 1),
+                id="sustained-exit-at-threshold",
+            ),
+            pytest.param(
+                ["out", "in", None, None, "out"],
+                {"max_absent_frames": 1},
+                (1, 0),
+                id="dropped-while-inside-is-not-an-exit",
+            ),
         ],
     )
     def test_counts_confirmed_boundary_crossings(
@@ -561,10 +585,33 @@ class TestPolygonZoneEntryExit:
         """A tracked object's entries and exits follow its confirmed side changes."""
         zone = sv.PolygonZone(POLYGON, **zone_kwargs)
 
-        for position in sequence:
-            zone.trigger(_tracked_frame([] if position is None else [position], [0]))
+        _run_sequence(zone, sequence)
 
         assert (zone.in_count, zone.out_count) == expected_in_out
+
+    def test_repeated_tracker_id_is_one_observation(self) -> None:
+        """Copies of one id in a frame cannot satisfy the debounce on their own."""
+        zone = sv.PolygonZone(POLYGON, minimum_crossing_threshold=3)
+        zone.trigger(_tracked_frame(["out"], [0]))
+        duplicates = _create_detections(
+            xyxy=[INSIDE_BOX] * 3, class_id=[0, 0, 0], tracker_id=[0, 0, 0]
+        )
+
+        zone.trigger(duplicates)
+
+        assert zone.in_count == 0
+
+    def test_counts_crossings_in_the_reference_frame(self) -> None:
+        """With camera motion, crossings are judged where the zone was drawn."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["out"], [0]))
+        shifted_inside = _create_detections(
+            xyxy=[[90.0, 140.0, 110.0, 160.0]], class_id=[0], tracker_id=[0]
+        )
+
+        zone.trigger(shifted_inside, coord_transform=_ShiftTransform(-50, 0))
+
+        assert zone.in_count == 1
 
     def test_counts_entries_and_exits_per_class(self) -> None:
         """Each crossing is attributed to the class of the crossing detection."""
@@ -699,15 +746,39 @@ class TestPolygonZoneOccupancy:
         """Compact and dense masks of the same objects give the same occupancy."""
         zone = sv.PolygonZone(POLYGON)
         masks = np.concatenate([_left_half_mask(), np.zeros((1, 250, 250), bool)])
-        masks[1, 150:181, 140:191] = True
+        masks[1, 150:240, 180:245] = True
         xyxy = sv.mask_to_xyxy(masks).astype(np.float32)
         compact = sv.CompactMask.from_dense(masks, xyxy, image_shape=(250, 250))
-        dense_detections = sv.Detections(xyxy=xyxy, mask=masks)
+        expected = zone.occupancy(sv.Detections(xyxy=xyxy, mask=masks))
         compact_detections = sv.Detections(xyxy=xyxy, mask=compact)
 
         occupancy = zone.occupancy(compact_detections)
 
-        assert occupancy == pytest.approx(zone.occupancy(dense_detections))
+        assert occupancy == pytest.approx(expected)
+
+    def test_compact_masks_outside_zone_are_zero(self) -> None:
+        """Compact masks that never touch the zone cover none of it."""
+        zone = sv.PolygonZone(POLYGON)
+        masks = np.zeros((2, 250, 250), dtype=bool)
+        masks[0, 10:40, 10:40] = True
+        masks[1, 210:240, 10:240] = True
+        xyxy = sv.mask_to_xyxy(masks).astype(np.float32)
+        compact = sv.CompactMask.from_dense(masks, xyxy, image_shape=(250, 250))
+
+        occupancy = zone.occupancy(sv.Detections(xyxy=xyxy, mask=compact))
+
+        assert occupancy == 0.0
+
+    def test_zone_with_negative_vertices(self) -> None:
+        """A zone reaching past the frame's top-left corner is measured where drawn."""
+        zone = sv.PolygonZone(
+            np.array([[-50, -50], [100, -50], [100, 100], [-50, 100]])
+        )
+        detections = sv.Detections(xyxy=np.array([[-50.0, -50.0, 100.0, 100.0]]))
+
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == 1.0
 
     def test_mask_image_smaller_than_zone(self) -> None:
         """Zone pixels beyond the mask's image are counted as uncovered."""
@@ -756,11 +827,29 @@ class TestPolygonZoneOccupancy:
 
         assert occupancy == pytest.approx(76 * 101 / ZONE_PIXELS)
 
+    def test_rotated_box_crossing_the_zone_edge_is_exact(self) -> None:
+        """A rotated box cut by the zone covers the pixels polygon_to_mask paints."""
+        zone = sv.PolygonZone(np.array([[39, 23], [98, 23], [98, 82], [39, 82]]))
+        corners = np.array([[[81, 1], [74, 37], [-6, 21], [2, -15]]], dtype=float)
+        detections = sv.Detections(
+            xyxy=np.array([[-6.0, -15.0, 81.0, 37.0]]),
+            data={ORIENTED_BOX_COORDINATES: corners},
+        )
 
-def _run_sequence(zone: sv.PolygonZone, sequence: list[str | None]) -> None:
-    """Trigger `zone` once per entry: 'in'/'out' for tracker 0, `None` for absent."""
-    for position in sequence:
-        zone.trigger(_tracked_frame([] if position is None else [position], [0]))
+        occupancy = zone.occupancy(detections)
+
+        assert occupancy == pytest.approx(435 / (60 * 60))
+
+    def test_rejects_misshaped_oriented_boxes(self) -> None:
+        """Oriented-box data must be `(N, K, 2)` corner arrays."""
+        zone = sv.PolygonZone(POLYGON)
+        detections = sv.Detections(
+            xyxy=np.array([[100.0, 100.0, 150.0, 150.0]]),
+            data={ORIENTED_BOX_COORDINATES: np.zeros((1, 8))},
+        )
+
+        with pytest.raises(ValueError, match=r"\(N, K, 2\)"):
+            zone.occupancy(detections)
 
 
 class TestPolygonZoneTimeInZone:
@@ -794,6 +883,12 @@ class TestPolygonZoneTimeInZone:
                 {"max_absent_frames": 1},
                 0.0,
                 id="long-absence-restarts",
+            ),
+            pytest.param(
+                ["in", "in", "out"],
+                {"minimum_crossing_threshold": 2},
+                2.0,
+                id="unconfirmed-exit-keeps-stay",
             ),
         ],
     )
@@ -842,6 +937,12 @@ class TestPolygonZoneTimeInZone:
                 id="unconfirmed-tracker",
             ),
             pytest.param(_create_detections(xyxy=[INSIDE_BOX]), id="untracked"),
+            pytest.param(
+                sv.Detections(
+                    xyxy=np.array([INSIDE_BOX]), tracker_id=np.array([np.nan])
+                ),
+                id="non-finite-tracker",
+            ),
         ],
     )
     def test_is_nan_without_a_confirmed_tracker_id(
@@ -867,7 +968,12 @@ class TestPolygonZoneTimeInZone:
         ("timestamps", "match"),
         [
             pytest.param([5.0, 4.0], "must not decrease", id="decreasing"),
-            pytest.param([5.0, None], "must not decrease", id="mixed-with-frames"),
+            pytest.param(
+                [5.0, None], "on every trigger call", id="seconds-then-frames"
+            ),
+            pytest.param(
+                [None, 100.0], "on every trigger call", id="frames-then-seconds"
+            ),
             pytest.param([np.nan], "must be finite", id="nan"),
             pytest.param([np.inf], "must be finite", id="inf"),
         ],
@@ -892,6 +998,44 @@ class TestPolygonZoneTimeInZone:
         zone.reset()
         zone.trigger(_tracked_frame(["in"], [0]))
 
+        dwell = zone.time_in_zone(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(dwell, [0.0])
+
+    def test_reset_allows_switching_timestamp_mode(self) -> None:
+        """After reset, a zone counted in frames can be given timestamps."""
+        zone = sv.PolygonZone(POLYGON)
+        _run_sequence(zone, ["in", "in"])
+        zone.reset()
+
+        zone.trigger(_tracked_frame(["in"], [0]), timestamp=10.0)
+
         np.testing.assert_array_equal(
             zone.time_in_zone(_tracked_frame(["in"], [0])), [0.0]
         )
+
+    def test_equal_timestamps_are_allowed(self) -> None:
+        """Two frames at the same time are not a decreasing clock."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["in"], [0]), timestamp=3.0)
+
+        zone.trigger(_tracked_frame(["in"], [0]), timestamp=3.0)
+
+        np.testing.assert_array_equal(
+            zone.time_in_zone(_tracked_frame(["in"], [0])), [0.0]
+        )
+
+    def test_failed_trigger_leaves_the_clock_unchanged(self) -> None:
+        """A frame whose coord_transform raises does not advance dwell."""
+        zone = sv.PolygonZone(POLYGON)
+        zone.trigger(_tracked_frame(["in"], [0]), timestamp=0.0)
+        with pytest.raises(ValueError, match="coord_transform must return"):
+            zone.trigger(
+                _tracked_frame(["in", "in"], [0, 0]),
+                coord_transform=_WrongShapeTransform(),
+                timestamp=100.0,
+            )
+
+        dwell = zone.time_in_zone(_tracked_frame(["in"], [0]))
+
+        np.testing.assert_array_equal(dwell, [0.0])

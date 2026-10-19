@@ -22,20 +22,28 @@ from supervision.geometry.core import (
 )
 from supervision.geometry.utils import get_polygon_center
 
+# Largest canvas, in pixels, on which one oriented box is rasterized whole for
+# PolygonZone.occupancy; larger polygons are rasterized on the zone's window.
+_MAX_POLYGON_CANVAS_PIXELS = 1 << 24
+
 
 class PolygonZone:
     """A class for defining a polygon-shaped zone within a frame for detecting objects.
 
     !!! warning
 
-        Entry and exit counts (`in_count`, `out_count` and their per-class
-        variants) and `time_in_zone` use the `tracker_id`. Read
+        Entry and exit counts
+        (:attr:`~supervision.detection.tools.polygon_zone.PolygonZone.in_count`,
+        :attr:`~supervision.detection.tools.polygon_zone.PolygonZone.out_count`
+        and their per-class variants) and
+        :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.time_in_zone`
+        use the `tracker_id`. Read
         [here](https://trackers.roboflow.com/latest/) to learn how to plug
         tracking into your inference pipeline. Without a `tracker_id` the counts
-        stay at zero and `time_in_zone` is `NaN`, while `current_count` and
-        `current_count_per_class` still work.
-        Detections with a negative `tracker_id`, which trackers report for
-        tracks they have not confirmed yet, never enter or exit.
+        stay at zero and dwell time is `NaN`, while `current_count` and
+        :attr:`~supervision.detection.tools.polygon_zone.PolygonZone.current_count_per_class`
+        still work. Detections with a negative `tracker_id`, which trackers
+        report for tracks they have not confirmed yet, never enter or exit.
 
     Attributes:
         polygon: A polygon represented by a numpy array of shape
@@ -217,6 +225,9 @@ class PolygonZone:
         self._away_since: dict[int, float] = {}
         self._frame_index = -1
         self._last_timestamp: float | None = None
+        # Whether trigger calls pass explicit timestamps; fixed by the first call so
+        # seconds and frame counts never mix in one dwell measurement.
+        self._uses_explicit_timestamps: bool | None = None
 
         x_max, y_max = np.max(polygon, axis=0)
         self.mask = polygon_to_mask(
@@ -280,6 +291,7 @@ class PolygonZone:
         self._away_since.clear()
         self._frame_index = -1
         self._last_timestamp = None
+        self._uses_explicit_timestamps = None
 
     def time_in_zone(self, detections: Detections) -> npt.NDArray[np.float64]:
         """Report how long each tracked detection has been inside the zone.
@@ -294,15 +306,20 @@ class PolygonZone:
         re-entry starts a new stay, while flicker shorter than
         `minimum_crossing_threshold` and absences up to `max_absent_frames` do
         not interrupt it. Detections are matched to the zone's state by
-        `tracker_id`, so pass the same frame's detections given to `trigger`.
+        `tracker_id`, so pass the same frame's detections given to
+        :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.trigger`.
 
         Args:
             detections: Tracked detections to look up.
 
         Returns:
             An array aligned with `detections` holding each object's time in the
-            zone, or `NaN` for an object that is not inside, has an unconfirmed
-            (negative) or missing `tracker_id`, or when `trigger` was never called.
+            zone, or `NaN` for an object that is not confirmed inside (with
+            `minimum_crossing_threshold` above 1, an entry or exit takes effect
+            only once confirmed), has a missing, negative or non-finite
+            `tracker_id`, or when
+            :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.trigger`
+            was never called.
 
         Example:
             ```pycon
@@ -324,13 +341,15 @@ class PolygonZone:
 
             ```
         """
+        entered_at = np.full(len(detections), np.nan)
         if detections.tracker_id is None or self._last_timestamp is None:
-            return np.full(len(detections), np.nan)
-        entered_at = np.fromiter(
-            (self._entered_at.get(int(key), np.nan) for key in detections.tracker_id),
-            dtype=np.float64,
-            count=len(detections),
-        )
+            return entered_at
+        tracker_ids = np.asarray(detections.tracker_id)
+        # Only finite, non-negative ids can have state; anything else stays NaN.
+        trackable = np.flatnonzero(np.isfinite(tracker_ids) & (tracker_ids >= 0))
+        entered_at[trackable] = [
+            self._entered_at.get(int(tracker_ids[i]), np.nan) for i in trackable
+        ]
         return self._last_timestamp - entered_at
 
     def occupancy(self, detections: Detections) -> float:
@@ -406,15 +425,18 @@ class PolygonZone:
                 :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.time_in_zone`.
                 Pass it on every call, for example `frame_index / fps` for
                 seconds in a video or `time.monotonic()` for a live stream, or
-                never, to measure time in frames.
+                never, to measure time in frames. Equal consecutive timestamps
+                are allowed.
 
         Returns:
             A boolean numpy array indicating
                 if each detection is within the polygon zone
 
         Raises:
-            ValueError: If `timestamp` is not finite or is earlier than the
-                previous frame's timestamp.
+            ValueError: If `timestamp` is not finite, is earlier than the
+                previous frame's timestamp, or is given on some calls but not
+                others since construction or the last
+                :meth:`~supervision.detection.tools.polygon_zone.PolygonZone.reset`.
 
         Example:
             ```pycon
@@ -434,25 +456,33 @@ class PolygonZone:
 
             ```
         """
+        uses_explicit_timestamps = timestamp is not None
+        if self._uses_explicit_timestamps not in (None, uses_explicit_timestamps):
+            raise ValueError(
+                "timestamp must be passed on every trigger call or on none, so "
+                "dwell is not measured in mixed units. Call reset() to switch."
+            )
         frame_timestamp = (
-            float(self._frame_index + 1) if timestamp is None else timestamp
+            float(timestamp) if timestamp is not None else self._frame_index + 1.0
         )
         if not np.isfinite(frame_timestamp):
             raise ValueError(f"timestamp must be finite; got {frame_timestamp}.")
-        # Also catches mixing explicit timestamps with the frame-count default.
         if self._last_timestamp is not None and frame_timestamp < self._last_timestamp:
             raise ValueError(
                 f"timestamp must not decrease; got {frame_timestamp} after "
                 f"{self._last_timestamp}. Call reset() before reusing the zone."
             )
-        self._frame_index += 1
-        self._last_timestamp = float(frame_timestamp)
 
         if len(detections) == 0:
             is_in_zone = np.array([], dtype=bool)
         else:
             is_in_zone = self._is_in_zone(detections, coord_transform)
-        self._update_counts(detections, is_in_zone, self._last_timestamp)
+        # The frame is committed only once the inside test has succeeded, so a
+        # failing coord_transform leaves the clock where it was.
+        self._uses_explicit_timestamps = uses_explicit_timestamps
+        self._frame_index += 1
+        self._last_timestamp = frame_timestamp
+        self._update_counts(detections, is_in_zone, frame_timestamp)
         return cast(npt.NDArray[np.bool_], is_in_zone)
 
     def _is_in_zone(
@@ -524,7 +554,13 @@ class PolygonZone:
 
         # Trackers report a negative id for tracks they have not confirmed yet, and
         # several distinct objects can share it, so such detections get no state.
-        confirmed = np.flatnonzero(detections.tracker_id >= 0)
+        tracker_ids = detections.tracker_id
+        confirmed = np.flatnonzero(tracker_ids >= 0)
+        # An id repeated within one frame, for example after merging overlapping
+        # sources, is one observation; counting each copy would let a single frame
+        # satisfy minimum_crossing_threshold. The first copy is kept.
+        _, first_copies = np.unique(tracker_ids[confirmed], return_index=True)
+        confirmed = confirmed[np.sort(first_copies)]
         self._age_absent_tracks(
             present={int(detections.tracker_id[i]) for i in confirmed}
         )
@@ -589,6 +625,11 @@ def _rasterize_detections(
         return _rasterize_masks(detections.mask, origin, shape)
     if ORIENTED_BOX_COORDINATES in detections.data:
         polygons = np.asarray(detections.data[ORIENTED_BOX_COORDINATES])
+        if polygons.ndim != 3 or polygons.shape[2] != 2:
+            raise ValueError(
+                f"detections.data[{ORIENTED_BOX_COORDINATES!r}] must have shape "
+                f"(N, K, 2); got {polygons.shape}."
+            )
         return _rasterize_polygons(polygons, origin, shape)
     return _rasterize_boxes(detections.xyxy, origin, shape)
 
@@ -624,7 +665,18 @@ def _rasterize_masks(
     height, width = shape
     window = np.zeros(shape, dtype=bool)
     if isinstance(masks, CompactMask):
-        union = _compact_mask_union([masks])
+        # Only masks whose crop touches the window can cover it; unioning the rest
+        # would make the cost grow with every object in the frame.
+        bounds = masks.bbox_xyxy
+        near = (
+            (bounds[:, 0] < x0 + width)
+            & (bounds[:, 2] >= x0)
+            & (bounds[:, 1] < y0 + height)
+            & (bounds[:, 3] >= y0)
+        )
+        if not near.any():
+            return window
+        union = _compact_mask_union([masks[near]])
         union_x, union_y = (int(value) for value in union.offsets[0])
         _or_into_window(window, origin, union.crop(0), (union_x, union_y))
     else:
@@ -638,18 +690,39 @@ def _rasterize_polygons(
     origin: tuple[int, int],
     shape: tuple[int, int],
 ) -> npt.NDArray[np.bool_]:
-    """Union filled polygons of shape `(N, K, 2)` inside the window."""
-    canvas = np.zeros(shape, dtype=np.uint8)
-    # Truncate absolute vertices first, as polygon_to_mask does, so the window
-    # holds exactly the pixels a full-frame mask would; the clip only keeps
+    """Union filled polygons of shape `(N, K, 2)` inside the window, matching what
+    `polygon_to_mask` paints on an unclipped canvas."""
+    x0, y0 = origin
+    height, width = shape
+    window = np.zeros(shape, dtype=bool)
+    # Truncate absolute vertices, as polygon_to_mask does; the clip only keeps
     # far-off vertices inside the int32 range fillPoly accepts.
     vertices = np.clip(polygons, -(2**30), 2**30).astype(np.int32)
-    shifted = vertices - np.array(origin, dtype=np.int32)
-    # One call per polygon: a single fillPoly over several polygons uses the
+    # One fillPoly per polygon: a single call over several polygons uses the
     # even-odd rule and would clear the pixels where two detections overlap.
-    for polygon in shifted:
-        cv2.fillPoly(canvas, [polygon], color=(1,))
-    return canvas.astype(bool)
+    for polygon in vertices:
+        low, high = polygon.min(axis=0), polygon.max(axis=0)
+        if (
+            high[0] < x0
+            or high[1] < y0
+            or low[0] >= x0 + width
+            or low[1] >= y0 + height
+        ):
+            continue
+        span_x, span_y = (int(value) for value in high - low + 1)
+        # fillPoly shifts boundary pixels of edges it clips at the canvas border,
+        # so each polygon is painted on a canvas that contains it whole; only
+        # implausibly large polygons fall back to the window, at ±1 px accuracy.
+        if span_x * span_y <= _MAX_POLYGON_CANVAS_PIXELS:
+            canvas_origin = (int(low[0]), int(low[1]))
+            canvas = np.zeros((span_y, span_x), dtype=np.uint8)
+        else:
+            canvas_origin = origin
+            canvas = np.zeros(shape, dtype=np.uint8)
+        shifted = polygon - np.array(canvas_origin, dtype=np.int32)
+        cv2.fillPoly(canvas, [shifted], color=(1,))
+        _or_into_window(window, origin, canvas.astype(bool), canvas_origin)
+    return window
 
 
 def _rasterize_boxes(
