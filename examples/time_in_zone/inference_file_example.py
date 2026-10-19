@@ -2,7 +2,6 @@ import numpy as np
 from inference import get_model
 from trackers import ByteTrackTracker
 from utils.general import find_in_list, load_zones_config
-from utils.timers import FPSBasedTimer
 
 import supervision as sv
 
@@ -48,10 +47,9 @@ def main(
         )
         for polygon in polygons
     ]
-    timers = [FPSBasedTimer(video_info.fps) for _ in zones]
 
     window = sv.ImageWindow("Processed Video")
-    for frame in frames_generator:
+    for frame_index, frame in enumerate(frames_generator):
         results = model.infer(
             frame, confidence=confidence_threshold, iou_threshold=iou_threshold
         )[0]
@@ -67,8 +65,11 @@ def main(
                 scene=annotated_frame, polygon=zone.polygon, color=COLORS.by_idx(idx)
             )
 
-            detections_in_zone = detections[zone.trigger(detections)]
-            time_in_zone = timers[idx].tick(detections_in_zone)
+            is_in_zone = zone.trigger(
+                detections, timestamp=frame_index / video_info.fps
+            )
+            detections_in_zone = detections[is_in_zone]
+            time_in_zone = zone.time_in_zone(detections_in_zone)
             custom_color_lookup = np.full(detections_in_zone.class_id.shape, idx)
 
             annotated_frame = COLOR_ANNOTATOR.annotate(

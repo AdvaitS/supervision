@@ -1,8 +1,9 @@
+import time
+
 import numpy as np
 from inference import get_model
 from trackers import ByteTrackTracker
 from utils.general import find_in_list, get_stream_frames_generator, load_zones_config
-from utils.timers import ClockBasedTimer
 
 import supervision as sv
 
@@ -48,7 +49,6 @@ def main(
         )
         for polygon in polygons
     ]
-    timers = [ClockBasedTimer() for _ in zones]
 
     window = sv.ImageWindow("Processed Video")
     for frame in frames_generator:
@@ -77,8 +77,9 @@ def main(
                 scene=annotated_frame, polygon=zone.polygon, color=COLORS.by_idx(idx)
             )
 
-            detections_in_zone = detections[zone.trigger(detections)]
-            time_in_zone = timers[idx].tick(detections_in_zone)
+            is_in_zone = zone.trigger(detections, timestamp=time.monotonic())
+            detections_in_zone = detections[is_in_zone]
+            time_in_zone = zone.time_in_zone(detections_in_zone)
             custom_color_lookup = np.full(detections_in_zone.class_id.shape, idx)
 
             annotated_frame = COLOR_ANNOTATOR.annotate(
@@ -87,8 +88,8 @@ def main(
                 custom_color_lookup=custom_color_lookup,
             )
             labels = [
-                f"#{tracker_id} {int(time // 60):02d}:{int(time % 60):02d}"
-                for tracker_id, time in zip(detections_in_zone.tracker_id, time_in_zone)
+                f"#{tracker_id} {int(t // 60):02d}:{int(t % 60):02d}"
+                for tracker_id, t in zip(detections_in_zone.tracker_id, time_in_zone)
             ]
             annotated_frame = LABEL_ANNOTATOR.annotate(
                 scene=annotated_frame,
