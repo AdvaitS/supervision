@@ -123,6 +123,8 @@ def main(
         sv.PolygonZone(
             polygon=polygon,
             triggering_anchors=(sv.Position.CENTER,),
+            # Ignore boxes flickering across the edge for under 3 frames.
+            minimum_crossing_threshold=3,
         )
         for polygon in polygons
     ]
@@ -142,11 +144,13 @@ def main(
                 scene=annotated_frame, polygon=zone.polygon, color=COLORS.by_idx(idx)
             )
 
-            is_in_zone = zone.trigger(
-                detections, timestamp=frame_index / video_info.fps
-            )
+            zone.trigger(detections, timestamp=frame_index / video_info.fps)
+            time_in_zone = zone.time_in_zone(detections)
+            # Dwell is NaN until an entry is confirmed, so only confirmed
+            # stays are drawn and labelled.
+            is_in_zone = ~np.isnan(time_in_zone)
             detections_in_zone = detections[is_in_zone]
-            time_in_zone = zone.time_in_zone(detections_in_zone)
+            time_in_zone = time_in_zone[is_in_zone]
             custom_color_lookup = np.full(detections_in_zone.class_id.shape, idx)
 
             annotated_frame = COLOR_ANNOTATOR.annotate(
